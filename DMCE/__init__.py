@@ -1,5 +1,5 @@
 from .networks import CNN
-from .diffusion_model import DiffusionModel, Trainer, Tester
+from .diffusion_model import DiffusionModel, Trainer, Tester, GuidedDiffusionModel, GuidedTester
 
 __all__ = ["diffusion_model",
            "networks",
@@ -8,4 +8,6 @@ __all__ = ["diffusion_model",
            "DiffusionModel",
            "Trainer",
            "Tester",
+           "GuidedDiffusionModel",
+           "GuidedTester",
            "CNN"]
