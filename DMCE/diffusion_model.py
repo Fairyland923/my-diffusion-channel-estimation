@@ -1233,3 +1233,187 @@ class Early_stopping:
         else:
             return False
 
+
+class GuidedDiffusionModel(DiffusionModel):
+    def __init__(self,
+                 model: networks.CNN,
+                 *,
+                 data_shape: Union[Tuple, list],
+                 complex_data: bool = True,
+                 loss_type: str = 'l2',
+                 which_schedule: str = 'linear',
+                 num_timesteps: int = 300,
+                 beta_start: float = 0.0001,
+                 beta_end: float = 0.035,
+                 loss_weighting: bool = False,
+                 clipping: bool = False,
+                 objective: str = 'pred_noise',
+                 reverse_method: str = 'reverse_mean',
+                 reverse_add_random: bool = False):
+        super().__init__(model, data_shape=data_shape, complex_data=complex_data, loss_type=loss_type,
+                         which_schedule=which_schedule, num_timesteps=num_timesteps, beta_start=beta_start,
+                         beta_end=beta_end, loss_weighting=loss_weighting, clipping=clipping,
+                         objective=objective, reverse_method=reverse_method,
+                         reverse_add_random=reverse_add_random)
+
+    @torch.no_grad()
+    def reverse_step(self, x_t: torch.Tensor, t: int, *, add_random: bool = False) -> torch.Tensor:
+        """
+        This method performs one DM reverse step for data samples.
+        As it is implemented, the samples are all assumed to be in the same DM timestep. This can be easily changed by
+        replacing the integer timestep with a tensor and removing the manual construction of 'batched_times'.
+        This version will be modified to include a likelihood score.
+        Parameters
+        ----------
+        x_t : Tensor of shape [batch_size, *self.data_shape]
+            batch_size different data samples
+        t : int
+            The current DM time step
+        add_random : bool
+            Specifies whether the reverse_step should be deterministic or include a noise sampling step.
+
+        Returns
+        -------
+        x_{t-1} : Tensor of shape [batch_size, *self.data_shape]
+            The data samples after one denoising step
+        """
+
+        # For now, this is the same as the parent class. It will be modified later.
+        return super().reverse_step(x_t, t, add_random=add_random)
+
+
+class GuidedTester(Tester):
+    def __init__(self,
+                 model: DiffusionModel,
+                 data: torch.Tensor,
+                 *,
+                 batch_size: int = 512,
+                 criteria: Union[list, Tuple] = None,
+                 complex_data: bool = True,
+                 return_all_timesteps: bool = False,
+                 fft_pre: bool = False,
+                 mode: str = '1D',
+                 ):
+        super().__init__(model, data, batch_size=batch_size, criteria=criteria, complex_data=complex_data,
+                         return_all_timesteps=return_all_timesteps, fft_pre=fft_pre, mode=mode)
+
+    @torch.no_grad()
+    def _test_nmse(self) -> dict:
+        """
+        Test function for the NMSE criterion. For different SNR values between -20 and 40 dB, the test data is corrupted
+        with noise and the DiffusionModel estimates the original data from the noisy input. For each SNR value, the MSE
+        normalized per sample and by the average power of the whole dataset is calculated.
+        This version uses a measurement matrix A.
+
+        Returns
+        -------
+        test_dict: dict
+            Dictionary with tested SNRs in dB, MSEs normalized per sample and MSEs normalized by the average data power
+        """
+
+        # specify which SNRs should be evaluated
+        snr_db_range = torch.arange(-10, 45, 5, dtype=torch.float32, device=self.device)
+        #snr_db_range = torch.arange(20, 30, 5, dtype=torch.float32, device=self.device)
+        snr_range = 10 ** (snr_db_range / 10)
+
+        #nmse_per_sample_list = []
+        nmse_total_power_list = []
+
+        with torch.no_grad():
+            for snr in tqdm(iterable=snr_range):
+                # test each SNR value
+                x_hat = []
+                for data_batch in self.dataloader:
+                    data_batch = data_batch.to(device=self.device)
+
+                    # add noise to the test data
+                    # y = functional.awgn(data_batch, snr, multiplier=self.model.noise_multiplier)
+
+                    # --- New measurement model y = A * h + n ---
+                    
+                    # 1. Convert to complex
+                    # data_batch is (B, 2, H, W) or (B, 2, H)
+                    # We assume dim=1 is the channel dimension with size 2 (real/imag)
+                    h_complex = utils.real2cmplx(data_batch, dim=1, squeezed=True) # (B, H, W) or (B, H)
+                    
+                    # Flatten h for matrix multiplication
+                    b_size = h_complex.shape[0]
+                    h_shape = h_complex.shape[1:]
+                    dim_h = int(np.prod(h_shape))
+                    h_flat = h_complex.reshape(b_size, -1) # (B, dim_h)
+
+                    # 2. Define Measurement Matrix A (Identity for now)
+                    # Ideally this should be defined outside the loop if constant
+                    A = torch.eye(dim_h, dtype=torch.complex64, device=self.device)
+
+                    # 3. Apply measurement model y = A @ h
+                    # h_flat: (B, dim_h), A: (dim_h, dim_h)
+                    # y_clean = (A @ h_flat.T).T = h_flat @ A.T
+                    y_clean_flat = torch.matmul(h_flat, A.T)
+
+                    # 4. Add Noise
+                    # We use multiplier=1.0 because we are adding noise to a complex tensor directly
+                    # functional.awgn adds (1/sqrt(snr)) * multiplier * randn_like
+                    # randn_like(complex) has variance 1. We want variance 1/snr.
+                    y_noisy_flat = functional.awgn(y_clean_flat, snr, multiplier=1.0)
+
+                    # 5. LS Estimation
+                    # h_ls = (A^H A)^-1 A^H y
+                    # Since A is identity, h_ls = y_noisy_flat
+                    # For general A:
+                    # A_H = A.conj().T
+                    # pinv_A = torch.linalg.pinv(A) # Or (A_H A)^-1 A_H
+                    # h_ls_flat = torch.matmul(y_noisy_flat, pinv_A.T)
+                    
+                    # For now, simple identity case:
+                    h_ls_flat = y_noisy_flat
+
+                    # 6. Reshape and convert back to real representation
+                    h_ls_complex = h_ls_flat.reshape(b_size, *h_shape)
+                    
+                    # Expand dims to insert the channel dim at index 1
+                    h_ls_complex = torch.unsqueeze(h_ls_complex, 1) # (B, 1, H, W)
+                    
+                    # Convert to real (B, 2, H, W)
+                    y = utils.cmplx2real(h_ls_complex, dim=1, new_dim=False).float()
+
+                    # -------------------------------------------
+
+                    # calculate channel estimate
+                    x_est = self.model.generate_estimate(y.to(device=self.device), snr, return_all_timesteps=self.return_all_timesteps)
+                    if self.fft_pre:
+                        if self.return_all_timesteps:
+                            x_est = ut.complex_1d_fft(x_est, ifft=True, mode=self.mode, _4d_array=True)
+                        else:
+                            x_est = ut.complex_1d_fft(x_est, ifft=True, mode=self.mode)
+                    x_hat.append(x_est)
+                x_hat = torch.cat(x_hat, dim=0).cpu()
+
+                if self.return_all_timesteps:
+                    nmse_total_power_list.append([])
+                    n_timesteps = x_hat.shape[1]
+                    if len(self.data.shape) == 5:
+                        dim = int(self.data.shape[-1] * self.data.shape[-2])
+                        x_hat = ut.reshape_fortran(x_hat, (-1, n_timesteps, dim))
+                        for t in range(n_timesteps):
+                            nmse_total_power_list[-1].append(functional.nmse_torch(ut.reshape_fortran(torch.squeeze(self.data),
+                                                                  (-1, dim)), x_hat[:, t], norm_per_sample=False))
+                    else:
+                        for t in range(n_timesteps):
+                            nmse_total_power_list[-1].append(
+                                functional.nmse_torch(torch.squeeze(self.data), torch.squeeze(x_hat[:, t]), norm_per_sample=False))
+                else:
+
+                    if len(self.data.shape) == 4:
+                        #print('Reshaping...')
+                        dim = int(self.data.shape[-1] * self.data.shape[-2])
+                        x_hat = ut.reshape_fortran(x_hat, (-1, dim))
+                        nmse_total_power_list.append(functional.nmse_torch(ut.reshape_fortran(torch.squeeze(self.data), (-1, dim)), x_hat, norm_per_sample=False))
+                    else:
+                        # calculate NMSE from estimated channels
+                        nmse_total_power_list.append(functional.nmse_torch(torch.squeeze(self.data), torch.squeeze(x_hat), norm_per_sample=False))
+
+        return {'SNRs': snr_db_range.tolist(),
+                'NMSEs_total_power': nmse_total_power_list,
+                }
+    

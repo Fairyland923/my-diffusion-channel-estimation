@@ -71,7 +71,7 @@ def main():
     cnn = DMCE.CNN(**cnn_dict)
 
     # instantiate the diffusion model and give it a reference to the unet model
-    diffusion_model = DMCE.DiffusionModel(cnn, **diff_model_dict)
+    diffusion_model = DMCE.GuidedDiffusionModel(cnn, **diff_model_dict)
 
     # load the parameters of the pre-trained model into the DiffusionModel instance
     model_path = os.path.join(model_dir, 'train_models')
@@ -92,7 +92,7 @@ def main():
     }
 
     # instantiate the Tester and give it a reference to the diffusion model as well as testing data
-    tester = DMCE.Tester(diffusion_model, data=data_test, **tester_dict)
+    tester = DMCE.GuidedTester(diffusion_model, data=data_test, **tester_dict)
 
     num_timesteps = sim_params['diff_model_dict']['num_timesteps']
 
@@ -106,7 +106,7 @@ def main():
     if return_all_timesteps:
         # plot all curves
         file_name = f'./results/dm_est/{date_time}_{ch_type}_dim={n_dim}x{n_dim2}_valdata={num_val_samples}_' \
-                    f'T={num_timesteps}_perstep_best.png'
+                    f'T={num_timesteps}_perstep_best_guided.png'
         plt.figure()
         lines = []
         for isnr in range(len(test_dict['nmse']['NMSEs_total_power'])):
@@ -134,7 +134,7 @@ def main():
             mse_list[-1].insert(0, 'nmse_dm')
             mse_list = [list(i) for i in zip(*mse_list)]
             file_name = f'./results/dm_est/{date_time}_{ch_type}_dim={n_dim}x{n_dim2}_valdata={num_val_samples}_' \
-                        f'T={num_timesteps}_best_SNR={list_snrs_all[i]}.csv'
+                        f'T={num_timesteps}_best_SNR={list_snrs_all[i]}_guided.csv'
             with open(file_name, 'w') as myfile:
                 wr = csv.writer(myfile, lineterminator='\n')
                 wr.writerows(mse_list)
@@ -151,7 +151,7 @@ def main():
     mse_list = [list(i) for i in zip(*mse_list)]
     print(mse_list)
     file_name = f'./results/dm_est/{date_time}_{ch_type}_dim={n_dim}x{n_dim2}_valdata={num_val_samples}_' \
-                f'T={num_timesteps}_resamp={reverse_add_random}_best.csv'
+                f'T={num_timesteps}_resamp={reverse_add_random}_best_guided.csv'
     with open(file_name, 'w') as myfile:
         wr = csv.writer(myfile, lineterminator='\n')
         wr.writerows(mse_list)
