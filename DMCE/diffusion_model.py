@@ -1359,14 +1359,8 @@ class GuidedTester(Tester):
 
                     # 5. LS Estimation
                     # h_ls = (A^H A)^-1 A^H y
-                    # Since A is identity, h_ls = y_noisy_flat
-                    # For general A:
-                    # A_H = A.conj().T
-                    # pinv_A = torch.linalg.pinv(A) # Or (A_H A)^-1 A_H
-                    # h_ls_flat = torch.matmul(y_noisy_flat, pinv_A.T)
-                    
-                    # For now, simple identity case:
-                    h_ls_flat = y_noisy_flat
+                    pinv_A = torch.linalg.pinv(A) # Or (A_H A)^-1 A_H
+                    h_ls_flat = torch.matmul(y_noisy_flat, pinv_A.T)
 
                     # 6. Reshape and convert back to real representation
                     h_ls_complex = h_ls_flat.reshape(b_size, *h_shape)
