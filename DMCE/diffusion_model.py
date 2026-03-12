@@ -1257,7 +1257,10 @@ class GuidedDiffusionModel(DiffusionModel):
                          reverse_add_random=reverse_add_random)
 
     @torch.no_grad()
-    def reverse_step(self, x_t: torch.Tensor, t: int, *, add_random: bool = False) -> torch.Tensor:
+    def reverse_step(self, x_t: torch.Tensor, t: int, *, add_random: bool = False, 
+                     A_info=None, 
+                     sigma_n=0.0, 
+                     gradient_scale=2.0) -> torch.Tensor:
         """
         This method performs one DM reverse step for data samples.
         As it is implemented, the samples are all assumed to be in the same DM timestep. This can be easily changed by
@@ -1271,6 +1274,9 @@ class GuidedDiffusionModel(DiffusionModel):
             The current DM time step
         add_random : bool
             Specifies whether the reverse_step should be deterministic or include a noise sampling step.
+        A_info: 预计算好的测量矩阵信息 (字典)
+        sigma_n: 测量噪声的标准差
+        gradient_scale: 引导权重 s (通常 > 1)
 
         Returns
         -------
@@ -1278,13 +1284,107 @@ class GuidedDiffusionModel(DiffusionModel):
             The data samples after one denoising step
         """
 
-        # For now, this is the same as the parent class. It will be modified later.
-        return super().reverse_step(x_t, t, add_random=add_random)
+        # 1. 得到 Diffusion 预测结果
+        Diffusion_pred = super().reverse_step(x_t, t, add_random=add_random)
+
+        # 2. 计算似然分数 (Likelihood Score)
+        if A_info is not None:
+            b, c, h, w = x_t.shape
+            # --- 边界转换：从实数张量 (B, 2, H, W) 到复数向量 (B, N) ---
+            # 假设 dim=1 是实部和虚部
+            h_t_complex = utils.real2cmplx(x_t, dim=1, squeezed=True) 
+            h_t_flat = h_t_complex.reshape(b, -1)  # 展平为 (B, N)
+
+            # 获取 alpha 参数
+            batched_times = torch.full((b,), t, device=self.device, dtype=torch.long)
+            alpha = utils.extract(self.alphas, batched_times, (b, 1))
+            alpha_bar = utils.extract(self.alphas_cumprod, batched_times, (b, 1))
+            
+            # 获取预计算的复数 SVD 组件
+            Uh_y = A_info['Uh_y']  # U^H @ y (复数)
+            S = A_info['S']        # 奇异值 (实数向量)
+            V = A_info['V']        # 右奇异矩阵 (复数矩阵)
+            
+            # --- 执行复数域矩阵计算 (公式 23)  ---
+            # 先确认S的维度
+            S = S.view(1, -1)  # 保证广播
+
+            # 计算 V^H @ h_t
+            VH_ht = torch.matmul(h_t_flat, V.conj()) 
+            
+            # 计算残差项
+            diff = Uh_y - (1.0 / torch.sqrt(alpha_bar)) * (S * VH_ht)
+            
+            # 计算对角阵逆项
+            inv_diag = 1.0 / (((1.0 - alpha_bar) / alpha_bar) * (S**2) + sigma_n**2)
+            
+            # 组合复数似然分数 l (Equation 23)
+            # score = 1/sqrt(alpha_bar) * V @ (S * inv_diag * diff)
+            l_complex_flat = (1.0 / torch.sqrt(alpha_bar)) * torch.matmul(S * inv_diag * diff, V.T)
+            
+            # --- 边界转换：从复数向量转回实数张量 (B, 2, H, W) ---
+            l_complex = l_complex_flat.reshape(b, h, w)
+            l_complex = torch.unsqueeze(l_complex, 1) # (B, 1, H, W)
+            l_real = utils.cmplx2real(l_complex, dim=1, new_dim=False).float()
+            
+            # 执行最终更新
+            update_coeff = gradient_scale * (1.0 - alpha) / torch.sqrt(alpha)
+            likelihood_score = update_coeff.reshape(b, 1, 1, 1) * l_real
+            x_pred = Diffusion_pred + likelihood_score
+        else:
+            x_pred = Diffusion_pred
+
+        return x_pred
+    
+    @torch.no_grad()
+    def reverse_sample_loop(self, x_t: torch.Tensor, t_start: int,
+                            *, return_all_timesteps: bool = False, add_random: bool = False,
+                            A_info=None, sigma_n=0.0, gradient_scale=2.0) -> torch.Tensor:
+        
+        assert t_start <= self.num_timesteps
+        assert utils.equal_iterables(x_t.shape[1:], self.data_shape)
+        x_all = [x_t]
+        for t in reversed(range(t_start)):
+            x_t = self.reverse_step(x_t, t, add_random=add_random,
+                                    A_info=A_info, 
+                                    sigma_n=sigma_n, 
+                                    gradient_scale=gradient_scale)
+            if return_all_timesteps:
+                x_all.append(x_t)
+
+        # clip the final samples for image data to the range [-1, 1]
+        if self.clipping:
+            x_all = [torch.clamp(x, -1, 1) for x in x_all]
+            x_t = torch.clamp(x_t, -1, 1)
+        if return_all_timesteps:
+            return torch.stack(x_all, dim=1)
+        else:
+            return x_t
+
+    @torch.no_grad()
+    def generate_estimate(self, y: torch.Tensor, snr: float, *, add_random: bool = None,
+                          return_all_timesteps: bool = False,
+                          A_info=None, sigma_n=0.0, gradient_scale=2.0) -> torch.Tensor:
+
+        add_random = utils.default(add_random, self.reverse_add_random)
+
+        # estimate t_hat, the time step that corresponds to the correct SNR
+        t = int(torch.abs(self.snrs - snr).argmin())
+
+        # normalize the input data accordingly (this might differ for other data than normalized channels)
+        norm_multiplier = (snr / (1 + snr)) ** 0.5
+        x_t = norm_multiplier * y
+
+        x_hat = self.reverse_sample_loop(x_t, t, return_all_timesteps=return_all_timesteps, add_random=add_random, 
+                                        A_info=A_info, 
+                                        sigma_n=sigma_n, 
+                                        gradient_scale=gradient_scale)
+        return x_hat
 
 
 class GuidedTester(Tester):
     def __init__(self,
-                 model: DiffusionModel,
+                 model: GuidedDiffusionModel,
                  data: torch.Tensor,
                  *,
                  batch_size: int = 512,
@@ -1319,10 +1419,24 @@ class GuidedTester(Tester):
         #nmse_per_sample_list = []
         nmse_total_power_list = []
 
+        # A 暂时用单位阵作为示例，后面生成随机矩阵，维度和导频数有关
+        dim_A_real = int(np.prod(self.model.data_shape)) 
+        dim_A_complex = dim_A_real // 2
+        A = torch.eye(dim_A_complex, dtype=torch.complex64, device=self.device)
+
+        # 预计算 SVD
+        U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+        # Vh 是 V 的共轭转置，所以 V = Vh^H
+        V = Vh.H
+
+        # N_t = self.model.data_shape[2]
+
         with torch.no_grad():
             for snr in tqdm(iterable=snr_range):
                 # test each SNR value
                 x_hat = []
+                sigma_n = torch.sqrt(1.0 / snr) # 这里不确定到底是 Nt 还是 1 不管了
+
                 for data_batch in self.dataloader:
                     data_batch = data_batch.to(device=self.device)
 
@@ -1332,49 +1446,53 @@ class GuidedTester(Tester):
                     # --- New measurement model y = A * h + n ---
                     
                     # 1. Convert to complex
-                    # data_batch is (B, 2, H, W) or (B, 2, H)
-                    # We assume dim=1 is the channel dimension with size 2 (real/imag)
-                    h_complex = utils.real2cmplx(data_batch, dim=1, squeezed=True) # (B, H, W) or (B, H)
+                    # data_batch is (B, 2, H, W) 
+                    # dim=1 is the channel dimension with size 2 (real/imag)
+                    h_complex = utils.real2cmplx(data_batch, dim=1, squeezed=True) # (B, H, W) 
                     
                     # Flatten h for matrix multiplication
                     b_size = h_complex.shape[0]
                     h_shape = h_complex.shape[1:]
-                    dim_h = int(np.prod(h_shape))
+                    dim_h = int(np.prod(h_shape)) # This should be equal to dim_A_complex
                     h_flat = h_complex.reshape(b_size, -1) # (B, dim_h)
 
-                    # 2. Define Measurement Matrix A (Identity for now)
-                    # Ideally this should be defined outside the loop if constant
-                    A = torch.eye(dim_h, dtype=torch.complex64, device=self.device)
-
-                    # 3. Apply measurement model y = A @ h
+                    # 2. Apply measurement model y = A @ h
                     # h_flat: (B, dim_h), A: (dim_h, dim_h)
                     # y_clean = (A @ h_flat.T).T = h_flat @ A.T
                     y_clean_flat = torch.matmul(h_flat, A.T)
 
-                    # 4. Add Noise
+                    # 3. Add Noise
                     # We use multiplier=1.0 because we are adding noise to a complex tensor directly
                     # functional.awgn adds (1/sqrt(snr)) * multiplier * randn_like
                     # randn_like(complex) has variance 1. We want variance 1/snr.
                     y_noisy_flat = functional.awgn(y_clean_flat, snr, multiplier=1.0)
 
-                    # 5. LS Estimation
+                    # 4. LS Estimation
                     # h_ls = (A^H A)^-1 A^H y
                     pinv_A = torch.linalg.pinv(A) # Or (A_H A)^-1 A_H
                     h_ls_flat = torch.matmul(y_noisy_flat, pinv_A.T)
 
-                    # 6. Reshape and convert back to real representation
+                    # 5. Reshape and convert back to real representation
                     h_ls_complex = h_ls_flat.reshape(b_size, *h_shape)
                     
                     # Expand dims to insert the channel dim at index 1
                     h_ls_complex = torch.unsqueeze(h_ls_complex, 1) # (B, 1, H, W)
                     
                     # Convert to real (B, 2, H, W)
-                    y = utils.cmplx2real(h_ls_complex, dim=1, new_dim=False).float()
+                    h_t = utils.cmplx2real(h_ls_complex, dim=1, new_dim=False).float()
 
-                    # -------------------------------------------
+                    # --- 预计算 A_info ---
+                    Uh_y = torch.matmul(y_noisy_flat, U.conj()) # ( B, dim_A_complex ) @ ( dim_A_complex, dim_A_complex ) -> (B, dim_A_complex)
+                
+                    A_info = {
+                        'Uh_y': Uh_y,
+                        'S': S,
+                        'V': V
+                    }
 
                     # calculate channel estimate
-                    x_est = self.model.generate_estimate(y.to(device=self.device), snr, return_all_timesteps=self.return_all_timesteps)
+                    x_est = self.model.generate_estimate(h_t.to(device=self.device), snr, return_all_timesteps=self.return_all_timesteps,
+                    A_info=A_info, gradient_scale=2.0, sigma_n=sigma_n)
                     if self.fft_pre:
                         if self.return_all_timesteps:
                             x_est = ut.complex_1d_fft(x_est, ifft=True, mode=self.mode, _4d_array=True)
