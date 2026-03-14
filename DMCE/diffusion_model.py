@@ -1535,6 +1535,8 @@ class GuidedTester(Tester):
                     }
 
                     # calculate channel estimate
+                    # 选择generate_estimate_gaussian可以直接从高斯噪声起步
+                    # 设置A_info = None可以退化为 prior only 方法
                     x_est = self.model.generate_estimate(h_t.to(device=self.device), snr, return_all_timesteps=self.return_all_timesteps,
                     A_info=A_info, gradient_scale=2.0, sigma_n=sigma_n)
                     if self.fft_pre:
