@@ -483,15 +483,15 @@ class DiffusionModel(nn.Module):
                           return_all_timesteps: bool = False) -> torch.Tensor:
         """
         Implements the estimation algorithm for channel data, but can also be used for other data types. Requires the DM
-        to already be trained in order to work properly. It scales the input and performs the reverse process starting
-        at the timestep that corresponds to the correct SNR value. Intended for public use.
+        to already be trained in order to work properly. It starts from pure Gaussian noise and performs the full
+        reverse process from timestep T down to 0. Intended for public use.
 
         Parameters
         ----------
         y : Tensor of shape [batch_size, *self.data_shape]
-            batch_size noisy data samples
+            batch_size noisy data samples (used only to determine the output shape and device)
         snr : float
-            Estimated or known SNR of the noisy data sample
+            Estimated or known SNR of the noisy data sample (kept for API compatibility, not used as starting point)
         return_all_timesteps : optional bool
             specifies whether to return the data samples of all timesteps or only the final one.
         add_random : optional bool
@@ -508,14 +508,11 @@ class DiffusionModel(nn.Module):
 
         add_random = utils.default(add_random, self.reverse_add_random)
 
-        # estimate t_hat, the time step that corresponds to the correct SNR
-        t = int(torch.abs(self.snrs - snr).argmin())
+        # start from pure Gaussian noise with the same shape and device as y
+        x_t = self.noise_multiplier * torch.randn_like(y)
 
-        # normalize the input data accordingly (this might differ for other data than normalized channels)
-        norm_multiplier = (snr / (1 + snr)) ** 0.5
-        x_t = norm_multiplier * y
-
-        x_hat = self.reverse_sample_loop(x_t, t, return_all_timesteps=return_all_timesteps, add_random=add_random)
+        x_hat = self.reverse_sample_loop(x_t, self.num_timesteps, return_all_timesteps=return_all_timesteps,
+                                         add_random=add_random)
         return x_hat
 
     @property
