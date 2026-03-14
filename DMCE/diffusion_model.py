@@ -1463,14 +1463,34 @@ class GuidedTester(Tester):
         #nmse_per_sample_list = []
         nmse_total_power_list = []
 
-        # A 暂时用单位阵作为示例，后面生成随机矩阵，维度和导频数有关
-        dim_A_real = int(np.prod(self.model.data_shape)) 
-        dim_A_complex = dim_A_real // 2
-        A = torch.eye(dim_A_complex, dtype=torch.complex64, device=self.device)
+        # # A 暂时用单位阵作为示例，后面生成随机矩阵，维度和导频数有关
+        # dim_A_real = int(np.prod(self.model.data_shape)) 
+        # dim_A_complex = dim_A_real // 2
+        # A = torch.eye(dim_A_complex, dtype=torch.complex64, device=self.device)
 
-        # 预计算 SVD
+        # # 预计算 SVD
+        # U, S, Vh = torch.linalg.svd(A, full_matrices=False)
+        # # Vh 是 V 的共轭转置，所以 V = Vh^H
+        # V = Vh.H
+
+        # ===== Measurement matrix A settings =====
+        # data_shape for complex channel is usually (2, N_r, N_t)
+        n_r = int(self.model.data_shape[-2])      # 接收天线数
+        n_t = int(self.model.data_shape[-1])      # 发射天线数
+        n_pilots = 16                               # 导频数（手动改这个，建议 <= n_t）
+
+        dim_h = n_r * n_t                          # 信道向量维度 N
+        dim_y = n_r * n_pilots                     # 观测向量维度 M
+
+        # 复高斯随机测量矩阵 A \in C^{M x N}
+        A = (torch.randn(dim_y, dim_h, device=self.device) +
+            1j * torch.randn(dim_y, dim_h, device=self.device)).to(torch.complex64) / np.sqrt(2.0)
+
+        # 归一化建议：让 E[A^H A] ≈ I，便于不同导频数下公平比较
+        A = A / np.sqrt(dim_y)
+
+        # 预计算 SVD（thin SVD）
         U, S, Vh = torch.linalg.svd(A, full_matrices=False)
-        # Vh 是 V 的共轭转置，所以 V = Vh^H
         V = Vh.H
 
         # N_t = self.model.data_shape[2]
@@ -1537,7 +1557,7 @@ class GuidedTester(Tester):
                     # calculate channel estimate
                     # 选择generate_estimate_gaussian可以直接从高斯噪声起步
                     # 设置A_info = None可以退化为 prior only 方法
-                    x_est = self.model.generate_estimate(h_t.to(device=self.device), snr, return_all_timesteps=self.return_all_timesteps,
+                    x_est = self.model.generate_estimate_gaussian(h_t.to(device=self.device), snr, return_all_timesteps=self.return_all_timesteps,
                     A_info=A_info, gradient_scale=2.0, sigma_n=sigma_n)
                     if self.fft_pre:
                         if self.return_all_timesteps:
