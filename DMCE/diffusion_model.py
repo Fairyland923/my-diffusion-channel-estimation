@@ -1381,6 +1381,50 @@ class GuidedDiffusionModel(DiffusionModel):
                                         gradient_scale=gradient_scale)
         return x_hat
 
+    @torch.no_grad()
+    def generate_estimate_gaussian(self, y: torch.Tensor, snr: float, *, 
+                                   add_random: bool = None,
+                                   return_all_timesteps: bool = False,
+                                   A_info=None, 
+                                   sigma_n=0.0, 
+                                   gradient_scale=2.0) -> torch.Tensor:
+        """
+        Implements the estimation algorithm for channel data, but can also be used for other data types. Requires the DM
+        to already be trained in order to work properly. It starts from pure Gaussian noise and performs the full
+        reverse process from timestep T down to 0. Intended for public use.
+
+        Parameters
+        ----------
+        y : Tensor of shape [batch_size, *self.data_shape]
+            batch_size noisy data samples (used only to determine the output shape and device)
+        snr : float
+            Estimated or known SNR of the noisy data sample (kept for API compatibility, not used as starting point)
+        return_all_timesteps : optional bool
+            specifies whether to return the data samples of all timesteps or only the final one.
+        add_random : optional bool
+            Specifies whether the reverse_step should be deterministic or include a noise sampling step.
+
+        Returns
+        -------
+        x_hat : Tensor of shape [n_samples, *self.data_shape]
+            The denoised data samples after the whole reverse process
+        OR
+        x_ts : Tensor of shape [t_start + 1, n_samples, *self.data_shape]
+            Collection of the  data samples in all timesteps. x_ts[-1] contains the fully denoised data samples.
+        """
+
+        add_random = utils.default(add_random, self.reverse_add_random)
+
+        # start from pure Gaussian noise with the same shape and device as y
+        x_t = self.noise_multiplier * torch.randn_like(y)
+
+        x_hat = self.reverse_sample_loop(x_t, self.num_timesteps,  
+                                        return_all_timesteps=return_all_timesteps, add_random=add_random, 
+                                        A_info=A_info, 
+                                        sigma_n=sigma_n, 
+                                        gradient_scale=gradient_scale)
+        return x_hat
+
 
 class GuidedTester(Tester):
     def __init__(self,
